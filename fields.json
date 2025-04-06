@@ -1,0 +1,79 @@
+{
+  "fields": [
+    {
+      "fieldKey": "Merchant",
+      "fieldType": "string",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Company phone",
+      "fieldType": "number",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Website",
+      "fieldType": "string",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Email",
+      "fieldType": "string",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Purchase Order #",
+      "fieldType": "number",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Dated As",
+      "fieldType": "date",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Vendor Name",
+      "fieldType": "string",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Company Name",
+      "fieldType": "string",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "CompanyAddress",
+      "fieldType": "string",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "CompanyPhoneNumber",
+      "fieldType": "number",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Subtotal",
+      "fieldType": "number",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Tax",
+      "fieldType": "number",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Total",
+      "fieldType": "number",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Signature",
+      "fieldType": "string",
+      "fieldFormat": "not-specified"
+    },
+    {
+      "fieldKey": "Quantity",
+      "fieldType": "number",
+      "fieldFormat": "not-specified"
+    }
+  ]
+}
