@@ -1,11 +1,6 @@
 {
   "fields": [
     {
-      "fieldKey": "Merchant",
-      "fieldType": "string",
-      "fieldFormat": "not-specified"
-    },
-    {
       "fieldKey": "Company phone",
       "fieldType": "number",
       "fieldFormat": "not-specified"
@@ -41,16 +36,6 @@
       "fieldFormat": "not-specified"
     },
     {
-      "fieldKey": "CompanyAddress",
-      "fieldType": "string",
-      "fieldFormat": "not-specified"
-    },
-    {
-      "fieldKey": "CompanyPhoneNumber",
-      "fieldType": "number",
-      "fieldFormat": "not-specified"
-    },
-    {
       "fieldKey": "Subtotal",
       "fieldType": "number",
       "fieldFormat": "not-specified"
@@ -62,16 +47,6 @@
     },
     {
       "fieldKey": "Total",
-      "fieldType": "number",
-      "fieldFormat": "not-specified"
-    },
-    {
-      "fieldKey": "Signature",
-      "fieldType": "string",
-      "fieldFormat": "not-specified"
-    },
-    {
-      "fieldKey": "Quantity",
       "fieldType": "number",
       "fieldFormat": "not-specified"
     }
