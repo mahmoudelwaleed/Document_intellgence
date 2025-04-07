@@ -1,12 +1,12 @@
-# -*- coding: utf-8 -*-
 import streamlit as st
 import os
 import json
 import io
 import re
 import pandas as pd
+import math # Needed for infinity
 from dotenv import load_dotenv
-from azure.ai.formrecognizer import DocumentAnalysisClient, DocumentField
+from azure.ai.formrecognizer import DocumentAnalysisClient, DocumentField, AnalyzeResult, Point
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError
 # Optional: Only needed for PDF preview in custom labeling
@@ -29,7 +29,11 @@ if not AZURE_ENDPOINT or not AZURE_KEY:
     st.stop()
 
 try:
-    client = DocumentAnalysisClient(AZURE_ENDPOINT, AzureKeyCredential(AZURE_KEY))
+    # Increased timeout for potentially larger 'prebuilt-document' responses
+    client = DocumentAnalysisClient(
+        AZURE_ENDPOINT, AzureKeyCredential(AZURE_KEY)
+        # , transport=RequestsTransport(connection_timeout=60, read_timeout=120) # Optional: if timeouts occur
+        )
 except Exception as e:
     st.error(f"Error initializing Azure client: {e}")
     st.stop()
@@ -47,8 +51,59 @@ def flatten_polygon(polygon):
     """Flattens list of Point(x,y) objects to [x1, y1, x2, y2, ...]."""
     flat_list = []
     if polygon:
-        for point in polygon: flat_list.extend([point.x, point.y])
+        # Check if the first element is a Point object or already flattened coords
+        if isinstance(polygon[0], Point):
+            for point in polygon: flat_list.extend([point.x, point.y])
+        elif isinstance(polygon[0], (float, int)) and len(polygon) % 2 == 0:
+            # Assume it's already flat [x1, y1, x2, y2...]
+             return polygon # Return as is
+        else: # Fallback for single Point or unexpected format
+             try:
+                 for point in polygon: flat_list.extend([point.x, point.y])
+             except AttributeError: # If it's not a Point object
+                 print(f"Warning: Unexpected polygon format for flattening: {polygon}. Returning empty list.")
+                 return []
+
     return flat_list
+
+
+def combine_polygons(polygons):
+    """Calculates the minimal bounding box enclosing multiple polygons."""
+    min_x, min_y = math.inf, math.inf
+    max_x, max_y = -math.inf, -math.inf
+
+    if not polygons:
+        return None
+
+    for polygon in polygons:
+        if not polygon: continue
+        # Handle both Point objects and flattened lists
+        points_to_process = []
+        if isinstance(polygon[0], Point):
+             points_to_process = polygon
+        elif isinstance(polygon[0], (float, int)) and len(polygon) % 2 == 0:
+             # Reconstruct points from flattened list
+             points_to_process = [Point(x=polygon[i], y=polygon[i+1]) for i in range(0, len(polygon), 2)]
+        else:
+            print(f"Warning: Skipping unexpected polygon format during combination: {polygon}")
+            continue
+
+        for point in points_to_process:
+            min_x = min(min_x, point.x)
+            min_y = min(min_y, point.y)
+            max_x = max(max_x, point.x)
+            max_y = max(max_y, point.y)
+
+    if math.isinf(min_x): # No valid points found
+        return None
+
+    # Return the 4 corners of the combined bounding box as Point objects
+    # (Format needed for flatten_polygon later)
+    return [
+        Point(x=min_x, y=min_y), Point(x=max_x, y=min_y),
+        Point(x=max_x, y=max_y), Point(x=min_x, y=max_y)
+    ]
+
 
 def load_fields():
     """Loads custom field definitions from FIELDS_FILE."""
@@ -105,7 +160,7 @@ mode = st.radio("Mode:", ("Pre-built Analysis", "Custom Model Training"), key="a
 
 # --- 🏠 PRE-BUILT ANALYSIS MODE ---
 if mode == "Pre-built Analysis":
-    st.title("📄 Azure Pre-built Document Analysis")
+    st.title("Pre-built Document Analysis")
     service_opts = {"Read":"prebuilt-read","Layout":"prebuilt-layout","General Docs":"prebuilt-document","Invoice":"prebuilt-invoice","Receipt":"prebuilt-receipt"}
     sel_srv_name = st.selectbox("Service", list(service_opts.keys()))
     sel_mdl_id = service_opts[sel_srv_name]
@@ -122,7 +177,7 @@ if mode == "Pre-built Analysis":
                 poller=client.begin_analyze_document(sel_mdl_id,**args); result=poller.result()
             st.success("Analysis complete!"); st.divider()
 
-            # --- Display Results Sequentially (No Tabs) ---
+            # --- Display Results Sequentially ---
             st.header("Analysis Results")
 
             # Section: Summary / Fields
@@ -147,82 +202,53 @@ if mode == "Pre-built Analysis":
                 st.json(kvp_disp)
                 st.divider()
 
-            # ============================================================
-            # Section: Tables (CORRECTED LOGIC)
-            # ============================================================
+            # Section: Tables
             if hasattr(result,"tables") and result.tables:
                 st.subheader("📊 Tables");
                 for i,tbl in enumerate(result.tables):
                     st.markdown(f"**Table {i+1} ({tbl.row_count}x{tbl.column_count})**")
                     if tbl.bounding_regions: st.caption(f"Pages: {[r.page_number for r in tbl.bounding_regions]}")
 
-                    # Initialize headers and the full data grid (including potential header rows)
                     hdrs=[""]*tbl.column_count
                     dt=[[""]*tbl.column_count for _ in range(tbl.row_count)]
                     has_h = False
-                    header_row_indices = set() # Keep track of row indices that contain headers
+                    header_row_indices = set()
 
-                    # Process all cells to populate headers and the full data grid (dt)
                     for cell in tbl.cells:
-                        # Check bounds first
                         if not (0 <= cell.row_index < tbl.row_count and 0 <= cell.column_index < tbl.column_count):
-                            # st.warning(f"Cell outside table bounds skipped: row {cell.row_index}, col {cell.column_index}", icon="⚠️")
-                            continue # Skip cells outside the table dimensions
+                            continue
 
-                        # Populate headers if cell is a columnHeader or header
-                        # Some models might use 'header' instead of 'columnHeader'
                         if cell.kind in ["columnHeader", "header"]:
                             hdrs[cell.column_index] = cell.content
                             has_h = True
-                            header_row_indices.add(cell.row_index) # Mark this row as containing header(s)
+                            header_row_indices.add(cell.row_index)
 
-                        # Always populate the full data grid (dt) based on cell position
-                        # We will filter out header rows later if needed
                         dt[cell.row_index][cell.column_index] = cell.content
 
-                    # --- Correction: Create data_rows by filtering out header rows from dt ---
                     data_rows = []
-                    if tbl.row_count > 0: # Only proceed if there are rows
+                    if tbl.row_count > 0:
                         for r_idx, row_content in enumerate(dt):
-                            # Add row to data_rows ONLY if its index wasn't marked as a header row
                             if r_idx not in header_row_indices:
                                 data_rows.append(row_content)
-                            # Edge case: if no headers were marked (has_h=False), keep all rows.
-                            # This case is handled implicitly as header_row_indices will be empty.
 
-                    # --- Create DataFrame ---
                     try:
-                        # Use custom headers only if headers were found (has_h) AND at least one header has content
                         if has_h and any(h for h in hdrs):
-                            # Use the filtered data_rows
                             df = pd.DataFrame(data_rows, columns=hdrs)
                         else:
-                            # If no headers or empty headers, use default integer headers.
-                            # If headers existed but were filtered out, data_rows is already correct.
-                            # If no headers existed, dt was never filtered, so use original dt or data_rows (they are the same).
-                            # Using data_rows is safer as it handles the filtered case correctly.
                             df = pd.DataFrame(data_rows)
-
                         st.dataframe(df, use_container_width=True, hide_index=True)
-
                     except Exception as e:
                         st.error(f"Table {i+1} display error: {e}")
-                        # Provide raw data for debugging if DataFrame creation fails
-                        st.text("Raw Headers Found:")
-                        st.json(hdrs)
-                        st.text("Raw Data Rows (Used for DataFrame):")
-                        st.json(data_rows) # Show the data used for DataFrame
+                        st.text("Raw Headers Found:"); st.json(hdrs)
+                        st.text("Raw Data Rows (Used for DataFrame):"); st.json(data_rows)
 
-                    st.markdown("---") # Separator between tables
+                    st.markdown("---")
                 st.divider()
-            # ============================================================
-            # End of Corrected Table Section
-            # ============================================================
 
             # Section: Full Text (OCR)
             if result.content:
                 st.subheader("📝 Full Text (OCR)");
-                st.text_area("Content",result.content,height=300); # Reduced height slightly
+                st.text_area("Content",result.content,height=300);
                 st.download_button("Download Text",result.content.encode('utf-8'),f"{fname_dl}_text.txt","text/plain")
                 st.divider()
             # Section: Raw JSON
@@ -236,7 +262,7 @@ if mode == "Pre-built Analysis":
 
 # --- 🛠 CUSTOM MODEL TRAINING MODE ---
 elif mode == "Custom Model Training":
-    st.title("🏗️ Custom Document Model Trainer")
+    st.title("Custom Document Model Trainer")
     load_fields() # Load fields when entering mode
 
     step = st.radio("Steps:", ["1️⃣ Define Fields", "2️⃣ Label Documents"], horizontal=True)
@@ -276,15 +302,9 @@ elif mode == "Custom Model Training":
             if len({f['fieldKey'].lower() for f in st.session_state.fields}) != len(st.session_state.fields): st.error("Duplicate names.")
             else: save_fields()
 
-    # ===================== Step 2: Label Documents (Improved Load/Save, Match, Location) =====================
+    # ===================== Step 2: Label Documents (Using General Docs Only) =====================
     elif step == "2️⃣ Label Documents":
         st.subheader("Label Document Fields")
-        st.markdown("""**Process:**
-1. Select doc. Runs Layout & General Document analysis.
-2. Loads existing labels (if any). Prioritizes suggestions from General Docs, then Layout KVPs.
-3. **Verify/Correct/Enter value text.** Location (`polygon`) is saved *only* if the exact text is found in Layout results.
-4. Save labels (overwrites `.labels.json`).""")
-        if not PDF2IMAGE_OK: st.info("Install `pdf2image`/Poppler for PDF previews.", icon="ℹ️")
 
         if not st.session_state.fields: st.warning("Define fields in Step 1 first.", icon="⚠️")
         else:
@@ -295,40 +315,48 @@ elif mode == "Custom Model Training":
 
                 if sel_file:
                     form_k=f"lblfrm_{sel_fname}"; sess_k_base=f"doc_{sel_fname}"
-                    layout_k=f"{sess_k_base}_layout"; doc_k=f"{sess_k_base}_doc"; img_k=f"{sess_k_base}_imgs"
-                    layout_kvp_k=f"{sess_k_base}_layout_kvp"; doc_kvp_k=f"{sess_k_base}_doc_kvp"
+                    # --- Simplified Keys: Only need doc result ---
+                    doc_k=f"{sess_k_base}_doc"; img_k=f"{sess_k_base}_imgs"
+                    doc_kvp_k=f"{sess_k_base}_doc_kvp"
                     base_fn=os.path.splitext(re.sub(r'[\\/*?:"<>|]',"",sel_fname))[0]
                     ocr_fn=f"{base_fn}.ocr.json"; lbl_fn=f"{base_fn}.labels.json"
                     ocr_fp=os.path.join(OCR_DIR,ocr_fn); lbl_fp=os.path.join(LABELS_DIR,lbl_fn)
 
-                    # --- Analyze if not cached ---
-                    analysis_needed = layout_k not in st.session_state or doc_k not in st.session_state
+                    # --- Analyze if not cached (Only General Document) ---
+                    analysis_needed = doc_k not in st.session_state
                     if analysis_needed:
                         try:
-                            with st.spinner(f"Analyzing {sel_fname} (Layout & General Doc)..."):
+                            # --- Updated Spinner ---
+                            with st.spinner(f"Analyzing {sel_fname} with General Document model..."):
                                 fbytes=sel_file.getvalue()
-                                poller_layout=client.begin_analyze_document("prebuilt-layout", io.BytesIO(fbytes)); st.session_state[layout_k]=poller_layout.result()
-                                poller_doc=client.begin_analyze_document("prebuilt-document", io.BytesIO(fbytes)); st.session_state[doc_k]=poller_doc.result()
-                            layout_res=st.session_state[layout_k]; doc_res=st.session_state[doc_k]
-                            layout_kvp_map={}; doc_kvp_map={}
-                            if hasattr(layout_res,'key_value_pairs'):
-                                for kvp in layout_res.key_value_pairs:
-                                    if kvp.key and kvp.value and kvp.key.content: ckey=clean_key_for_matching(kvp.key.content);
-                                    if ckey: layout_kvp_map[ckey]=kvp.value
-                            st.session_state[layout_kvp_k]=layout_kvp_map
-                            if hasattr(doc_res,'documents') and doc_res.documents:
-                                for doc in doc_res.documents:
+                                # --- Run ONLY General Document ---
+                                poller_doc=client.begin_analyze_document("prebuilt-document", io.BytesIO(fbytes));
+                                doc_result : AnalyzeResult = poller_doc.result() # Get doc result
+                                st.session_state[doc_k] = doc_result # Store the single result
+
+                            # --- Populate doc_kvp_map from the doc_result ---
+                            doc_kvp_map={}
+                            if hasattr(doc_result,'documents') and doc_result.documents:
+                                for doc in doc_result.documents:
                                      if hasattr(doc,'fields') and doc.fields:
                                          for fname, fobj in doc.fields.items():
                                              if fobj and fobj.content: ckey = clean_key_for_matching(fname);
-                                             if ckey: doc_kvp_map[ckey] = fobj
-                            if hasattr(doc_res,'key_value_pairs'):
-                                for kvp in doc_res.key_value_pairs:
+                                             if ckey: doc_kvp_map[ckey] = fobj # Priority 1: Structured fields
+                            if hasattr(doc_result,'key_value_pairs'):
+                                for kvp in doc_result.key_value_pairs:
                                      if kvp.key and kvp.value and kvp.key.content: ckey=clean_key_for_matching(kvp.key.content);
-                                     if ckey and ckey not in doc_kvp_map: doc_kvp_map[ckey]=kvp.value
+                                     if ckey and ckey not in doc_kvp_map: # Priority 2: KVP if not already in fields
+                                         doc_kvp_map[ckey]=kvp.value
                             st.session_state[doc_kvp_k]=doc_kvp_map
+
                             st.success("Analysis complete.")
-                        except Exception as e: st.error(f"Analyze error {sel_fname}: {e}"); st.stop()
+                        except HttpResponseError as e:
+                             st.error(f"Azure Analysis error {sel_fname}: {e.message} (Status: {e.status_code})")
+                             st.stop()
+                        except Exception as e:
+                            st.error(f"Analysis error {sel_fname}: {e}")
+                            st.exception(e) # Show full traceback for unexpected errors
+                            st.stop()
 
                     # --- Load Existing Labels ---
                     existing_labels={} # fieldKey -> list of value dicts
@@ -348,109 +376,172 @@ elif mode == "Custom Model Training":
                          if sel_file.type=="application/pdf" and PDF2IMAGE_OK:
                              try: imgs=convert_from_bytes(sel_file.getvalue())
                              except Exception as pdf_e: st.warning(f"PDF Preview err: {pdf_e}",icon="⚠️"); imgs=None
-                         elif sel_file.type.startswith("image/"): imgs=[sel_file]
+                         elif sel_file.type.startswith("image/"): imgs=[io.BytesIO(sel_file.getvalue())] # Wrap image bytes
                          st.session_state[img_k]=imgs or None
                     if st.session_state.get(img_k):
                          st.subheader("Preview"); max_p=1
-                         for i,img in enumerate(st.session_state[img_k]):
-                             if i<max_p: st.image(img,caption=f"Pg {i+1}",use_container_width=True) # Use container_width
+                         for i,img_data in enumerate(st.session_state[img_k]):
+                             if i<max_p: st.image(img_data,caption=f"Pg {i+1}",use_container_width=True)
                              else: st.caption(f"...({len(st.session_state[img_k])-max_p} more pgs)"); break
                          st.divider()
 
                     # --- Labeling Form ---
                     st.subheader("Verify / Enter Field Values")
-                    if layout_k in st.session_state and doc_k in st.session_state:
-                        layout_res=st.session_state[layout_k];
-                        layout_kvp_map=st.session_state.get(layout_kvp_k,{}); doc_kvp_map=st.session_state.get(doc_kvp_k,{})
-
-                        # --- DEBUG KVP ---
-                        # with st.expander("Debug: KVP Maps for Suggestions"):
-                        #    st.write("**Gen Doc KVP (Clean Key -> Value):**"); st.json({k:(v.content if hasattr(v,'content') else str(v)) for k,v in doc_kvp_map.items()})
-                        #    st.write("**Layout KVP (Clean Key -> Value):**"); st.json({k:(v.content if hasattr(v,'content') else str(v)) for k,v in layout_kvp_map.items()})
-                        # ---
+                    # --- Check only for doc_k ---
+                    if doc_k in st.session_state:
+                        # --- Get the single document result ---
+                        doc_res : AnalyzeResult = st.session_state[doc_k]
+                        doc_kvp_map = st.session_state.get(doc_kvp_k,{})
 
                         with st.form(key=form_k):
-                            form_vals={} # { fk: { text: "...", source_obj: Field/Element|None, existing_loc: {} } }
+                            form_vals={} # { fk: { text: "...", source_obj_for_suggestion: Field/Element|None, existing_loc: {} } }
                             for field in st.session_state.fields:
-                                fk=field["fieldKey"]; fk_l=fk.lower(); init_val=""; sugg_src=None; conf_s=""; ex_loc={}
+                                fk=field["fieldKey"]; init_val=""; sugg_src=None; conf_s=""; ex_loc={}
 
-                                # 1. Check existing labels
+                                # 1. Check existing labels first
                                 if fk in existing_labels and existing_labels[fk]:
                                     first_val=existing_labels[fk][0]; init_val=first_val.get("text","")
+                                    # Store existing location info if present
                                     if "polygon" in first_val: ex_loc["polygon"]=first_val["polygon"]
-                                    if "span" in first_val: ex_loc["span"]=first_val["span"] # Keep existing span
                                     if "page" in first_val: ex_loc["page"]=first_val["page"]
-                                    conf_s="(Using existing label)"
-                                # 2. If no existing, try suggestions
+                                    # Potentially span info if needed, though polygon+page is standard for DI Studio
+                                    # if "span" in first_val: ex_loc["span"]=first_val["span"]
+                                    conf_s="(Using existing label)" # Set status message
+                                # 2. If no existing, try suggestions ONLY from General Doc KVP
                                 else:
-                                    clean_fk = clean_key_for_matching(fk); sugg_found=False; src_tag=""
-                                    if clean_fk in doc_kvp_map: # Priority: Gen Doc
-                                        sugg_src=doc_kvp_map[clean_fk]; init_val=sugg_src.content if hasattr(sugg_src,'content') else ""; sugg_found=True; src_tag="[Doc]"
-                                    elif clean_fk in layout_kvp_map: # Fallback: Layout
-                                        sugg_src=layout_kvp_map[clean_fk]; init_val=sugg_src.content if hasattr(sugg_src,'content') else ""; sugg_found=True; src_tag="[Layout]"
+                                    clean_fk = clean_key_for_matching(fk); sugg_src = None
+                                    if clean_fk in doc_kvp_map: # Priority: Gen Doc KVP
+                                        sugg_src = doc_kvp_map[clean_fk]
+                                        init_val = sugg_src.content if hasattr(sugg_src,'content') else ""
+                                        # Safely get confidence and format status message
+                                        conf_val = sugg_src.confidence if hasattr(sugg_src, 'confidence') and sugg_src.confidence is not None else "N/A"
+                                        conf_s = f"(Sugg [Doc] Conf: {conf_val:.2f})" if isinstance(conf_val, float) else f"(Sugg [Doc] Conf: {conf_val})"
+                                    else: # No existing label and no suggestion found
+                                        conf_s = "(No suggestion / No existing)"
 
-                                    # Safely get confidence
-                                    if sugg_found and hasattr(sugg_src,'confidence') and sugg_src.confidence!=None: conf_s=f"(Sugg {src_tag} Conf:{sugg_src.confidence:.2f})"
-                                    elif sugg_found: conf_s=f"(Sugg {src_tag} Conf: N/A)"
-                                    else: conf_s="(No suggestion / No existing)"
-
+                                # Display field name and status
                                 st.markdown(f"**{fk}** `{conf_s}`")
+                                # Display text input with initial value (from label or suggestion or empty)
                                 corrected_text=st.text_input(f"Value:",value=init_val,key=f"in_{form_k}_{fk}")
-                                form_vals[fk]={"text":corrected_text,"source_obj_for_suggestion":sugg_src,"existing_location":ex_loc}
+                                # Store data needed for saving
+                                form_vals[fk]={"text":corrected_text, "source_obj_for_suggestion":sugg_src, "existing_location":ex_loc}
+
 
                             submitted=st.form_submit_button("💾 Save Labels for this Doc") # Inside the form
                             if submitted:
-                                # --- Save Logic (OVERWRITE with Location Search) ---
+                                # --- Save Logic (using doc_res for both OCR and Location) ---
 
-                                # 1. Save OCR ref (with page numbers)
+                                # 1. Save OCR ref (uses doc_res)
                                 try:
                                     ocr_out={"words":[]};
-                                    if hasattr(layout_res, 'pages'):
-                                        for pg_idx, pg in enumerate(layout_res.pages):
+                                    # --- Use doc_res.pages ---
+                                    if hasattr(doc_res, 'pages'):
+                                        for pg_idx, pg in enumerate(doc_res.pages):
                                             page_num = pg.page_number if pg.page_number else pg_idx + 1
                                             if hasattr(pg, 'words'):
-                                                for w in pg.words: ocr_out["words"].append({"text":w.content,"polygon":flatten_polygon(w.polygon),"confidence":w.confidence,"page": page_num})
+                                                for w in pg.words:
+                                                    # Ensure polygon is available before flattening
+                                                    poly_flat = flatten_polygon(w.polygon) if w.polygon else None
+                                                    ocr_out["words"].append({
+                                                        "text":w.content,
+                                                        "polygon":poly_flat, # Store flattened or None
+                                                        "confidence":w.confidence,
+                                                        "page": page_num
+                                                    })
                                     with open(ocr_fp,"w",encoding='utf-8') as f: json.dump(ocr_out,f,indent=2)
                                     st.success(f"OCR ref saved: `{ocr_fp}`")
                                 except Exception as e: st.error(f"OCR save err: {e}")
 
-                                # 2. Construct final labels list using Layout words for location
+                                # 2. Construct final labels list using General Doc words for location
                                 final_labels=[]
-                                st.write("--- Saving Labels (Searching Layout Words for Location) ---") # Add indicator
+                                # --- Updated indicator text ---
+                                st.write("--- Saving Labels (Searching General Document Words for Location) ---")
 
-                                all_layout_words = [] # Rebuild flat list of layout words with location info
-                                if hasattr(layout_res, 'pages'):
-                                     for pg_idx, pg in enumerate(layout_res.pages):
+                                # --- Build word list from doc_res (store original polygon objects) ---
+                                all_doc_words = []
+                                if hasattr(doc_res, 'pages'):
+                                     for pg_idx, pg in enumerate(doc_res.pages):
                                          page_num = pg.page_number if pg.page_number else pg_idx + 1
                                          if hasattr(pg, 'words'):
                                               for word in pg.words:
-                                                   all_layout_words.append({"content": word.content, "polygon": word.polygon, "page": page_num}) # Keep polygon object
+                                                   # Store the word with its ORIGINAL polygon (list of Point)
+                                                   all_doc_words.append({
+                                                       "content": word.content,
+                                                       "polygon": word.polygon, # Keep Point objects
+                                                       "page": page_num
+                                                   })
 
+                                # --- NEW: Multi-Word Matching Logic ---
                                 for field_key, form_data in form_vals.items():
                                     text_value = form_data["text"].strip() # Use final, stripped text
-                                    # source_obj_for_suggestion = form_data["source_obj_for_suggestion"] # Only used for initial text suggestion
-                                    # existing_location = form_data["existing_location"] # No longer needed if layout search works
 
                                     if text_value: # Only save non-empty values
-                                        label_entry = {"label": field_key}; value_details = {"text": text_value}
-                                        location_found = False
+                                        label_entry = {"label": field_key}
+                                        value_details = {"text": text_value}
+                                        found_match = False
+                                        matched_word_objects = [] # Store the original word dicts
 
-                                        # --- Search Layout Words for Exact Text Match ---
-                                        first_match_word = None
-                                        for layout_word in all_layout_words:
-                                            # Consider case sensitivity? Let's keep exact match for now.
-                                            if layout_word["content"] == text_value:
-                                                first_match_word = layout_word
-                                                break # Use first match
+                                        # Iterate through potential starting words
+                                        for i in range(len(all_doc_words)):
+                                            start_word = all_doc_words[i]
+                                            if not start_word["content"] or not text_value.startswith(start_word["content"]):
+                                                continue # Skip if word is empty or doesn't match start
 
-                                        if first_match_word:
-                                            value_details["page"] = first_match_word["page"]
-                                            value_details["polygon"] = flatten_polygon(first_match_word["polygon"])
-                                            location_found = True
+                                            current_match_text = start_word["content"]
+                                            current_match_words = [start_word]
+                                            current_page = start_word["page"]
+
+                                            # If the first word itself is the full match
+                                            if current_match_text == text_value:
+                                                found_match = True
+                                                matched_word_objects = current_match_words
+                                                break # Found exact single-word match
+
+                                            # Look ahead for subsequent words on the same page
+                                            for j in range(i + 1, len(all_doc_words)):
+                                                next_word = all_doc_words[j]
+
+                                                # Stop if page changes or word is empty
+                                                if next_word["page"] != current_page or not next_word["content"]:
+                                                    break
+
+                                                # Check if adding the next word (with a space) continues the match
+                                                potential_text = current_match_text + " " + next_word["content"]
+
+                                                if text_value.startswith(potential_text):
+                                                    current_match_text = potential_text
+                                                    current_match_words.append(next_word)
+
+                                                    # Check if we found the full match
+                                                    if current_match_text == text_value:
+                                                        found_match = True
+                                                        matched_word_objects = current_match_words
+                                                        break # Inner loop break (found sequence)
+                                                else:
+                                                    # Sequence broken
+                                                    break
+                                            # If found match in inner loop, break outer loop too
+                                            if found_match:
+                                                break
+                                        # --- End of Search ---
+
+                                        if found_match and matched_word_objects:
+                                            # Combine polygons of matched words
+                                            combined_poly_points = combine_polygons([w["polygon"] for w in matched_word_objects])
+                                            if combined_poly_points:
+                                                value_details["page"] = matched_word_objects[0]["page"] # Page of the first word
+                                                value_details["polygon"] = flatten_polygon(combined_poly_points) # Flatten the combined box
+                                            else:
+                                                st.warning(f"'{field_key}': Found text match for '{text_value}' but couldn't combine polygons. Saving text only.", icon="ℹ️")
+
                                         else:
-                                            st.warning(f"'{field_key}': No exact match for '{text_value}' in Layout words. Saving text only.", icon="ℹ️")
+                                            # --- Updated warning ---
+                                            st.warning(f"'{field_key}': No exact word sequence found for '{text_value}' in General Document words. Saving text only.", icon="ℹ️")
 
                                         label_entry["value"] = [value_details]; final_labels.append(label_entry)
+                                    # --- End if text_value ---
+                                # --- End for field_key ---
+
 
                                 # 3. Construct final file content & save
                                 final_lbl_fc={
